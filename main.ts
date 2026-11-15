@@ -1,103 +1,69 @@
-// Entry point: start the forge on an ephemeral port, register that port with the
-// harness, then wait for the harness to say the suite is done. The forge is one
-// process and one in-memory store; it exits cleanly only after /done says so.
+// Entrypoint: create the store, start the server on an ephemeral port,
+// register the port with the harness, long-poll /done and exit 0 when done.
+import { makeStore, createAppServer } from './app.ts';
 
-import { createAppServer, makeStore } from './app.ts';
-
-const envUrl = process.env.MAKEFUN_ENV_URL ?? '';
-if (!envUrl) {
-  console.error('MAKEFUN_ENV_URL is not set');
-  process.exit(1);
-}
-
-const store = makeStore();
-const server = createAppServer(store);
-
-/** Shut the server down cleanly (the harness ends a trial with SIGTERM). */
-let shuttingDown = false;
-function shutdown(): void {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  server.close(() => {
-    process.exit(0);
-  });
-  // If close hangs, force the exit shortly after.
-  setTimeout(() => process.exit(0), 2000).unref();
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/$/, '');
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** POST {port} to the harness register endpoint, retrying on transient failures. */
 async function register(port: number): Promise<void> {
-  let delay = 250;
-  for (;;) {
+  // Retry with exponential backoff (200 ms -> 400 ms -> ... capped at 2 s):
+  // the harness is usually up already, but a cold start can lag a few
+  // seconds, and a fixed retry loop would hammer it.
+  let delay = 200;
+  for (let attempt = 0; attempt < 20; attempt++) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
-      let res: Response;
-      try {
-        res = await fetch(`${envUrl}/register`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ port }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) {
-        console.error(`register rejected with HTTP ${res.status}`);
-        process.exit(1);
-      }
-      console.error(`register got HTTP ${res.status}; retrying in ${delay}ms`);
-    } catch (e) {
-      console.error(`register failed (${e instanceof Error ? e.message : String(e)}); retrying in ${delay}ms`);
+      const r = await fetch(ENV_URL + '/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port }),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) return;
+    } catch {
+      // The harness may not be listening yet; retry.
     }
     await sleep(delay);
     delay = Math.min(delay * 2, 2000);
   }
+  console.error('[forge] could not register with the harness');
 }
 
-/** Long-poll GET /done until the harness reports the suite finished. */
-async function waitForDone(): Promise<void> {
+async function waitDone(): Promise<void> {
   for (;;) {
+    await sleep(500);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
-      let res: Response;
-      try {
-        res = await fetch(`${envUrl}/done`, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
-      } else {
-        console.error(`done poll got HTTP ${res.status}; retrying`);
-      }
-    } catch (e) {
-      console.error(`done poll failed (${e instanceof Error ? e.message : String(e)}); retrying`);
+      const r = await fetch(ENV_URL + '/done', { signal: AbortSignal.timeout(2000) });
+      const j = (await r.json()) as { done?: boolean };
+      if (j && j.done === true) return;
+    } catch {
+      // Transient; keep polling.
     }
-    await sleep(250);
   }
 }
 
-server.listen(0, async () => {
-  const address = server.address();
-  const port = typeof address === 'object' && address !== null ? address.port : 0;
-  if (!port) {
-    console.error('could not determine the listening port');
-    process.exit(1);
+const store = makeStore();
+const server = createAppServer(store, TOKEN);
+
+server.listen(0, '127.0.0.1', () => {
+  const addr = server.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  console.error('[forge] listening on 127.0.0.1:' + port);
+  if (!ENV_URL) {
+    console.error('[forge] MAKEFUN_ENV_URL is not set; serving without registering');
+    return;
   }
-  console.error(`forge listening on port ${port}`);
-  await register(port);
-  console.error(`forge registered with harness at ${envUrl}`);
-  await waitForDone();
-  shutdown();
+  void (async () => {
+    await register(port);
+    await waitDone();
+    server.close(() => process.exit(0));
+    // Fall back to a forced exit if close hangs.
+    setTimeout(() => process.exit(0), 1000).unref();
+  })();
 });
+
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
