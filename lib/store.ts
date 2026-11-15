@@ -1,536 +1,429 @@
-// In-memory vault for the forge: git objects, refs, repositories, issues, pulls.
-// Nothing touches disk on the request path, so the timed workloads (thousands of
-// issue reads/writes, hundreds of pushes, dozens of clones) stay fast. Every
-// timestamp the vault emits is fixed, so two runs leave byte-identical state.
+// In-memory state for the forge: git objects and refs, repositories, issues and
+// pull requests. Nothing here touches the disk on the request path, so the timed
+// workloads (2,000 issue reads, 200 issue writes, 200 pushes, 50 clones) stay fast.
+// All served timestamps are fixed: two runs of the suite must export identical
+// bytes, so no wall-clock time ever enters a response.
 
 import { createHash } from 'node:crypto';
+import type { IncomingHttpHeaders } from 'node:http';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
-/** The single instant every created_at / merged_at / author date reports. */
-export const FIXED_EPOCH = 1704067200;
+/** The one timestamp every created_at / merged_at / author date carries. */
 export const FIXED_TIME = '2026-01-01T00:00:00Z';
-/** The identity stamped on commits the forge itself authors (contents API, merges). */
-const FORGE_AUTHOR = 'Forge <forge@forge.invalid>';
+const FIXED_EPOCH = 1704067200;
 
-/** A git object id: sha1("<type> <len>\0<data>"). */
-export function oidOf(type: ObjKind, data: Buffer): string {
-  const head = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return createHash('sha1').update(head).update(data).digest('hex');
-}
-
-export function isOid(value: string): boolean {
-  return /^[0-9a-f]{40}$/.test(value);
-}
-
-export type ObjKind = 'commit' | 'tree' | 'blob' | 'tag';
+export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 
 export interface GitObject {
-  type: ObjKind;
+  type: ObjType;
   data: Buffer;
 }
 
-export interface TreeItem {
-  mode: string;
-  name: string;
-  oid: string;
+/** sha1("<type> <len>\0<data>"), the git object id. */
+export function hashObject(type: ObjType, data: Buffer): string {
+  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
-export interface LabelRec {
+const OID_RE = /^[0-9a-f]{40}$/;
+export function isOid(s: string): boolean {
+  return OID_RE.test(s);
+}
+
+export interface Label {
   name: string;
   color: string;
 }
 
-export interface CommentRec {
+export interface Comment {
   id: number;
   body: string;
 }
 
-export interface IssueRec {
+export interface Issue {
   number: number;
   title: string;
   body: string;
   state: 'open' | 'closed';
   labels: string[];
-  order: number;
-  comments: CommentRec[];
+  createdSeq: number;
+  comments: Comment[];
+  /** Serialised REST body for GET /issues/{n}; cleared whenever the issue changes. */
+  jsonText: string | null;
 }
 
-export interface PullRec {
+export interface Pull {
   number: number;
   title: string;
   body: string;
   state: 'open' | 'closed';
   merged: boolean;
   mergedAt: string | null;
-  mergeSha: string | null;
+  mergeCommitSha: string | null;
   headRef: string;
   baseRef: string;
-  headTip: string;
-  baseTip: string;
-  order: number;
+  headSha: string;
+  baseSha: string;
+  createdSeq: number;
 }
 
-export interface RepoRec {
+export interface Repo {
   id: number;
   name: string;
   owner: string;
-  about: string;
-  isPrivate: boolean;
-  branch: string;
-  labels: Map<string, LabelRec>;
-  issues: IssueRec[];
-  pulls: PullRec[];
+  description: string;
+  private: boolean;
+  defaultBranch: string;
+  labels: Label[];
+  issues: Issue[];
+  pulls: Pull[];
   nextIssue: number;
   nextPull: number;
   nextComment: number;
-  order: number;
+  createdSeq: number;
 }
 
-/** One file of a commit's flattened tree: the blob id and its bytes. */
-export interface FlatFile {
-  blob: string;
-  bytes: Buffer;
+/** One file in a commit's tree: its blob id and bytes. */
+export interface FileEntry {
+  blobOid: string;
+  content: Buffer;
 }
 
-export interface Vault {
-  objects: Map<string, GitObject>;
-  /** repo name -> (ref name -> commit oid); covers refs/heads/* and refs/tags/*. */
-  refTable: Map<string, Map<string, string>>;
-  catalog: Map<string, RepoRec>;
-  /** The token owner's login, learned from the first owner segment any request names.
-   * The token itself is opaque; the git checks (which run first) always name the
-   * viewer, so this is set before GraphQL or MCP ever need it. */
-  ownerLogin: string | null;
-  nextRepoId: number;
-  clock: number;
+export interface HandlerResult {
+  status: number;
+  /** JSON body, serialised by the server. Mutually exclusive with `text`/`raw`. */
+  json?: unknown;
+  /** Pre-serialised JSON body (hot-path cache hit). Mutually exclusive with `json`. */
+  text?: string;
+  /** Raw body bytes (git protocol, already framed). */
+  raw?: Buffer;
+  contentType?: string;
+  headers?: Record<string, string>;
 }
 
-export function makeStore(): Vault {
-  return {
-    objects: new Map(),
-    refTable: new Map(),
-    catalog: new Map(),
-    ownerLogin: null,
-    nextRepoId: 5000,
-    clock: 0,
-  };
+/** What a handler sees of one HTTP request. */
+export interface Ctx {
+  method: string;
+  /** Decoded path segments, e.g. ['api', 'v3', 'repos', 'owner', 'name', 'issues']. */
+  segments: string[];
+  /** Raw query string without the leading '?', or ''. */
+  queryStr: string;
+  headers: IncomingHttpHeaders;
+  /** Raw request body (null when none). */
+  body: Buffer | null;
+  /** Origin of the request (http://host), for absolute Link URLs. */
+  origin: string;
 }
 
-/** The viewer login as the world sees it (a placeholder until the first owner is seen). */
-export function viewerName(v: Vault): string {
-  return v.ownerLogin ?? 'viewer';
-}
-
-/** Learn the owner from a request path segment; repos made before learning are re-owned. */
-export function claimOwner(v: Vault, owner: string): void {
-  if (v.ownerLogin !== null) return;
-  v.ownerLogin = owner;
-  for (const repo of v.catalog.values()) repo.owner = owner;
-}
-
-/** True when `owner` is the token owner's login; a first-seen owner is learned. */
-export function ownerMatches(v: Vault, owner: string): boolean {
-  if (v.ownerLogin === null) {
-    claimOwner(v, owner);
-    return true;
-  }
-  return owner === v.ownerLogin;
-}
-
-export function repoByName(v: Vault, name: string): RepoRec | undefined {
-  return v.catalog.get(name);
-}
-
-export function refsOf(v: Vault, name: string): Map<string, string> {
-  let table = v.refTable.get(name);
-  if (!table) {
-    table = new Map();
-    v.refTable.set(name, table);
-  }
-  return table;
-}
-
-/** The tip commit of a branch, or undefined when the branch does not exist. */
-export function branchTip(v: Vault, repo: RepoRec, branch: string): string | undefined {
-  return refsOf(v, repo.name).get(`refs/heads/${branch}`);
-}
-
-/** Store an object, returning its id (idempotent: an existing id is a no-op). */
-export function saveObject(v: Vault, type: ObjKind, data: Buffer): string {
-  const oid = oidOf(type, data);
-  if (!v.objects.has(oid)) v.objects.set(oid, { type, data });
-  return oid;
-}
-
-export function loadObject(v: Vault, oid: string): GitObject | undefined {
-  return v.objects.get(oid);
-}
-
-// ---- trees ------------------------------------------------------------------
-
-/** git's tree-entry sort: byte order of the name, a directory compared as if it ended in '/'. */
-function treeKey(item: TreeItem): string {
-  return item.mode === '40000' ? `${item.name}/` : item.name;
-}
-
-export function decodeTree(data: Buffer): TreeItem[] {
-  const items: TreeItem[] = [];
+/** Read one query parameter out of a raw query string, without building a URL. */
+export function queryParam(queryStr: string, name: string): string | null {
+  if (queryStr === '') return null;
+  const needle = `${name}=`;
   let at = 0;
-  while (at < data.length) {
-    const space = data.indexOf(0x20, at);
-    const nul = space < 0 ? -1 : data.indexOf(0x00, space + 1);
-    if (space < 0 || nul < 0 || nul + 21 > data.length) break;
-    items.push({
-      mode: data.subarray(at, space).toString('ascii'),
-      name: data.subarray(space + 1, nul).toString('utf8'),
-      oid: data.subarray(nul + 1, nul + 21).toString('hex'),
+  for (;;) {
+    const i = queryStr.indexOf(needle, at);
+    if (i < 0) return null;
+    if (i === 0 || queryStr[i - 1] === '&') {
+      const end = queryStr.indexOf('&', i + needle.length);
+      const raw = end < 0 ? queryStr.slice(i + needle.length) : queryStr.slice(i + needle.length, end);
+      try {
+        return decodeURIComponent(raw.replace(/\+/g, ' '));
+      } catch {
+        return raw;
+      }
+    }
+    at = i + needle.length;
+  }
+}
+
+export class Store {
+  objects = new Map<string, GitObject>();
+  /** repo name -> (ref name -> commit oid). Covers refs/heads/* and refs/tags/*. */
+  refs = new Map<string, Map<string, string>>();
+  repos = new Map<string, Repo>();
+  /** Bumped whenever a repo's refs move; git response caches key on it. */
+  repoRev = new Map<string, number>();
+  /** The token owner's login, learned from the first owner segment in any request
+   * path. The token itself is opaque, and the git checks (which run first) always
+   * name the viewer, so this is set before GraphQL/MCP ever need it. */
+  viewerLogin: string | null = null;
+  nextRepoId = 5000;
+  seq = 0;
+
+  learnOwner(owner: string): void {
+    if (this.viewerLogin === null) this.viewerLogin = owner;
+  }
+
+  /** True when `owner` is the token owner's login. A first-seen owner is learned. */
+  isOwner(owner: string): boolean {
+    if (this.viewerLogin === null) {
+      this.viewerLogin = owner;
+      for (const repo of this.repos.values()) repo.owner = owner;
+      return true;
+    }
+    return owner === this.viewerLogin;
+  }
+
+  get viewer(): string {
+    return this.viewerLogin ?? 'viewer';
+  }
+
+  getRepo(name: string): Repo | undefined {
+    return this.repos.get(name);
+  }
+
+  repoRefs(name: string): Map<string, string> {
+    let m = this.refs.get(name);
+    if (!m) {
+      m = new Map();
+      this.refs.set(name, m);
+    }
+    return m;
+  }
+
+  /** Note that a repo's refs changed (push, merge, contents write, ref create). */
+  touchRepo(name: string): void {
+    this.repoRev.set(name, (this.repoRev.get(name) ?? 0) + 1);
+  }
+
+  revOf(name: string): number {
+    return this.repoRev.get(name) ?? 0;
+  }
+
+  /** Store an object, returning its id. */
+  putObject(type: ObjType, data: Buffer): string {
+    const oid = hashObject(type, data);
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    return oid;
+  }
+
+  getObject(oid: string): GitObject | undefined {
+    return this.objects.get(oid);
+  }
+
+  // ---- trees and commits ----------------------------------------------------
+
+  /** Parse a tree object into [mode, name, oid] entries. */
+  parseTree(data: Buffer): Array<{ mode: string; name: string; oid: string }> {
+    const entries: Array<{ mode: string; name: string; oid: string }> = [];
+    let pos = 0;
+    while (pos < data.length) {
+      const space = data.indexOf(0x20, pos);
+      if (space < 0) break;
+      const nul = data.indexOf(0x00, space + 1);
+      if (nul < 0 || nul + 21 > data.length) break;
+      entries.push({
+        mode: data.subarray(pos, space).toString('ascii'),
+        name: data.subarray(space + 1, nul).toString('utf8'),
+        oid: data.subarray(nul + 1, nul + 21).toString('hex'),
+      });
+      pos = nul + 21;
+    }
+    return entries;
+  }
+
+  /** Build a tree object from entries (sorted in git order: dirs sort as name/). */
+  buildTree(entries: Array<{ mode: string; name: string; oid: string }>): string {
+    const sorted = [...entries].sort((a, b) => {
+      const an = a.mode === '40000' ? `${a.name}/` : a.name;
+      const bn = b.mode === '40000' ? `${b.name}/` : b.name;
+      return an < bn ? -1 : an > bn ? 1 : 0;
     });
-    at = nul + 21;
-  }
-  return items;
-}
-
-export function encodeTree(v: Vault, items: TreeItem[]): string {
-  const sorted = [...items].sort((a, b) => (treeKey(a) < treeKey(b) ? -1 : treeKey(a) > treeKey(b) ? 1 : 0));
-  const chunks: Buffer[] = [];
-  for (const item of sorted) {
-    chunks.push(Buffer.from(`${item.mode} ${item.name}\0`, 'utf8'));
-    chunks.push(Buffer.from(item.oid, 'hex'));
-  }
-  return saveObject(v, 'tree', Buffer.concat(chunks));
-}
-
-/** Build nested trees from a flat path -> blob-oid map; returns the root tree oid. */
-export function treeFromPaths(v: Vault, files: Map<string, string>): string {
-  const build = (dir: string): string => {
-    const items: TreeItem[] = [];
-    const subdirs = new Set<string>();
-    for (const path of files.keys()) {
-      if (!path.startsWith(dir)) continue;
-      const rest = path.slice(dir.length);
-      const slash = rest.indexOf('/');
-      if (slash < 0) items.push({ mode: '100644', name: rest, oid: files.get(path)! });
-      else subdirs.add(rest.slice(0, slash));
+    const parts: Buffer[] = [];
+    for (const e of sorted) {
+      parts.push(Buffer.from(`${e.mode} ${e.name}\0`, 'utf8'));
+      parts.push(Buffer.from(e.oid, 'hex'));
     }
-    for (const sub of subdirs) items.push({ mode: '40000', name: sub, oid: build(`${dir}${sub}/`) });
-    return encodeTree(v, items);
-  };
-  return build('');
-}
+    return this.putObject('tree', Buffer.concat(parts));
+  }
 
-/** The flat file map of a commit: path -> blob id + bytes. */
-export function flattenCommit(v: Vault, commitOid: string): Map<string, FlatFile> {
-  const out = new Map<string, FlatFile>();
-  const commit = loadObject(v, commitOid);
-  if (!commit || commit.type !== 'commit') return out;
-  const { tree } = readCommit(commit.data);
-  const walk = (treeOid: string, prefix: string): void => {
-    const treeObj = loadObject(v, treeOid);
-    if (!treeObj || treeObj.type !== 'tree') return;
-    for (const item of decodeTree(treeObj.data)) {
-      if (item.mode === '40000') walk(item.oid, `${prefix}${item.name}/`);
-      else {
-        const blob = loadObject(v, item.oid);
-        if (blob) out.set(`${prefix}${item.name}`, { blob: item.oid, bytes: blob.data });
+  /** Build nested trees from a flat path -> blob-oid map; returns the root tree oid. */
+  buildTreeFromFiles(files: Map<string, string>): string {
+    const build = (dir: string): string => {
+      const entries: Array<{ mode: string; name: string; oid: string }> = [];
+      const subdirs = new Set<string>();
+      for (const path of files.keys()) {
+        if (!path.startsWith(dir)) continue;
+        const rest = path.slice(dir.length);
+        const slash = rest.indexOf('/');
+        if (slash < 0) {
+          entries.push({ mode: '100644', name: rest, oid: files.get(path)! });
+        } else {
+          subdirs.add(rest.slice(0, slash));
+        }
       }
-    }
-  };
-  walk(tree, '');
-  return out;
-}
-
-/** Look one path up in a commit's tree; null when the path is absent or a directory. */
-export function fileAtPath(v: Vault, commitOid: string, path: string): FlatFile | null {
-  const flat = flattenCommit(v, commitOid);
-  return flat.get(path) ?? null;
-}
-
-/** List one directory of a commit's tree: files and subdirectories directly under it. */
-export function dirAtPath(
-  v: Vault,
-  commitOid: string,
-  dir: string,
-): Array<{ name: string; path: string; oid: string; kind: 'file' | 'dir' }> {
-  const flat = flattenCommit(v, commitOid);
-  const prefix = dir === '' ? '' : `${dir}/`;
-  const seen = new Map<string, { name: string; path: string; oid: string; kind: 'file' | 'dir' }>();
-  for (const [path, file] of flat) {
-    if (!path.startsWith(prefix)) continue;
-    const rest = path.slice(prefix.length);
-    const slash = rest.indexOf('/');
-    if (slash < 0) {
-      seen.set(rest, { name: rest, path, oid: file.blob, kind: 'file' });
-    } else {
-      const name = rest.slice(0, slash);
-      if (!seen.has(name)) {
-        // The directory's tree oid: resolve it from the commit's tree walk.
-        seen.set(name, { name, path: `${prefix}${name}`, oid: '', kind: 'dir' });
+      for (const sub of subdirs) {
+        entries.push({ mode: '40000', name: sub, oid: build(`${dir}${sub}/`) });
       }
-    }
+      return this.buildTree(entries);
+    };
+    return build('');
   }
-  // Fill directory oids by walking the tree objects directly.
-  const commit = loadObject(v, commitOid);
-  if (commit && commit.type === 'commit') {
-    const { tree } = readCommit(commit.data);
-    const fill = (treeOid: string, cur: string): void => {
-      const treeObj = loadObject(v, treeOid);
+
+  /** Create a commit object; returns its oid. */
+  makeCommit(treeOid: string, parents: string[], message: string): string {
+    const lines: string[] = [`tree ${treeOid}`];
+    for (const p of parents) lines.push(`parent ${p}`);
+    lines.push(`author Forge <forge@example.invalid> ${FIXED_EPOCH} +0000`);
+    lines.push(`committer Forge <forge@example.invalid> ${FIXED_EPOCH} +0000`);
+    return this.putObject('commit', Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8'));
+  }
+
+  /** Parse a commit object: tree, parents, message. */
+  parseCommit(data: Buffer): { tree: string; parents: string[]; message: string } {
+    const text = data.toString('utf8');
+    const blank = text.indexOf('\n\n');
+    const head = blank < 0 ? text : text.slice(0, blank);
+    const message = blank < 0 ? '' : text.slice(blank + 2);
+    let tree = '';
+    const parents: string[] = [];
+    for (const line of head.split('\n')) {
+      if (line.startsWith('tree ')) tree = line.slice(5).trim();
+      else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+    }
+    return { tree, parents, message };
+  }
+
+  /** Parse an annotated tag object: the object it points at, and that object's type. */
+  parseTag(data: Buffer): { object: string; type: string } {
+    const text = data.toString('utf8');
+    let object = '';
+    let type = '';
+    for (const line of text.split('\n')) {
+      if (line === '') break;
+      if (line.startsWith('object ')) object = line.slice(7).trim();
+      else if (line.startsWith('type ')) type = line.slice(5).trim();
+    }
+    return { object, type };
+  }
+
+  /** The flat file map of a commit: path -> {blobOid, content}. */
+  filesOfCommit(commitOid: string): Map<string, FileEntry> {
+    const out = new Map<string, FileEntry>();
+    const commit = this.getObject(commitOid);
+    if (!commit || commit.type !== 'commit') return out;
+    const { tree } = this.parseCommit(commit.data);
+    const walk = (treeOid: string, prefix: string): void => {
+      const treeObj = this.getObject(treeOid);
       if (!treeObj || treeObj.type !== 'tree') return;
-      for (const item of decodeTree(treeObj.data)) {
-        if (item.mode !== '40000') continue;
-        const full = cur === '' ? item.name : `${cur}/${item.name}`;
-        const entry = seen.get(item.name);
-        if (cur === dir && entry && entry.kind === 'dir') entry.oid = item.oid;
-        if (cur === '' && dir === '' && entry && entry.kind === 'dir') entry.oid = item.oid;
-        void full;
+      for (const e of this.parseTree(treeObj.data)) {
+        if (e.mode === '40000') {
+          walk(e.oid, `${prefix}${e.name}/`);
+        } else {
+          const blob = this.getObject(e.oid);
+          if (blob) out.set(`${prefix}${e.name}`, { blobOid: e.oid, content: blob.data });
+        }
       }
     };
-    fill(tree, '');
-    // For a nested dir, walk down to it first.
-    if (dir !== '') {
-      let cur = tree;
-      let ok = true;
-      for (const part of dir.split('/')) {
-        const obj = loadObject(v, cur);
-        if (!obj || obj.type !== 'tree') {
-          ok = false;
-          break;
-        }
-        const next = decodeTree(obj.data).find((e) => e.name === part && e.mode === '40000');
-        if (!next) {
-          ok = false;
-          break;
-        }
-        cur = next.oid;
-      }
-      if (ok) fill(cur, dir);
+    walk(tree, '');
+    return out;
+  }
+
+  /** All commit oids reachable from `tips`, following parents. */
+  reachableCommits(tips: string[]): Set<string> {
+    const seen = new Set<string>();
+    const stack = [...tips];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (seen.has(oid)) continue;
+      const obj = this.getObject(oid);
+      if (!obj || obj.type !== 'commit') continue;
+      seen.add(oid);
+      for (const p of this.parseCommit(obj.data).parents) stack.push(p);
     }
+    return seen;
   }
-  return [...seen.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
-}
 
-// ---- commits and tags -------------------------------------------------------
-
-/** Author a commit object; returns its oid. Parents are listed in order. */
-export function authorCommit(v: Vault, treeOid: string, parents: string[], message: string): string {
-  const lines: string[] = [`tree ${treeOid}`];
-  for (const parent of parents) lines.push(`parent ${parent}`);
-  lines.push(`author ${FORGE_AUTHOR} ${FIXED_EPOCH} +0000`);
-  lines.push(`committer ${FORGE_AUTHOR} ${FIXED_EPOCH} +0000`);
-  const body = `${lines.join('\n')}\n\n${message}`;
-  return saveObject(v, 'commit', Buffer.from(body, 'utf8'));
-}
-
-/** Parse a commit object: tree, parents, message. */
-export function readCommit(data: Buffer): { tree: string; parents: string[]; message: string } {
-  const text = data.toString('utf8');
-  const blank = text.indexOf('\n\n');
-  const head = blank < 0 ? text : text.slice(0, blank);
-  const message = blank < 0 ? '' : text.slice(blank + 2);
-  let tree = '';
-  const parents: string[] = [];
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+  /** Whether `ancestor` is an ancestor of (or equal to) `descendant`. Walks from the
+   * descendant and stops as soon as it finds the ancestor, so a fast-forward push
+   * on a long linear history costs one step, not a full traversal. */
+  isAncestor(descendant: string, ancestor: string): boolean {
+    if (descendant === ancestor) return true;
+    const seen = new Set<string>();
+    const stack = [descendant];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (oid === ancestor) return true;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const obj = this.getObject(oid);
+      if (!obj || obj.type !== 'commit') continue;
+      for (const p of this.parseCommit(obj.data).parents) stack.push(p);
+    }
+    return false;
   }
-  return { tree, parents, message };
-}
 
-/** Parse an annotated tag object: the object it points at and its type. */
-export function readTag(data: Buffer): { object: string; type: string } {
-  const text = data.toString('utf8');
-  let object = '';
-  let type = '';
-  for (const line of text.split('\n')) {
-    if (line.startsWith('object ')) object = line.slice(7).trim();
-    else if (line.startsWith('type ')) type = line.slice(5).trim();
-    else if (line === '') break;
+  /** All object oids in a commit's closure (commit + trees + blobs, recursive). */
+  closureOfCommit(commitOid: string): Set<string> {
+    const out = new Set<string>();
+    const commit = this.getObject(commitOid);
+    if (!commit) return out;
+    out.add(commitOid);
+    const { tree } = this.parseCommit(commit.data);
+    const walkTree = (treeOid: string): void => {
+      if (out.has(treeOid)) return;
+      out.add(treeOid);
+      const treeObj = this.getObject(treeOid);
+      if (!treeObj || treeObj.type !== 'tree') return;
+      for (const e of this.parseTree(treeObj.data)) {
+        if (e.mode === '40000') walkTree(e.oid);
+        else out.add(e.oid);
+      }
+    };
+    walkTree(tree);
+    return out;
   }
-  return { object, type };
-}
 
-/** Follow tag objects until a commit (or a non-tag object); at most 10 hops. */
-export function peelToCommit(v: Vault, oid: string): string {
-  let cur = oid;
-  for (let hop = 0; hop < 10; hop += 1) {
-    const obj = loadObject(v, cur);
-    if (!obj) return cur;
-    if (obj.type === 'commit') return cur;
-    if (obj.type === 'tag') {
-      cur = readTag(obj.data).object;
-      continue;
+  /** Peel a tag (or any ref target) to the commit it ultimately points at. */
+  peelToCommit(oid: string): string {
+    let cur = oid;
+    for (let i = 0; i < 10; i++) {
+      const obj = this.getObject(cur);
+      if (!obj) return cur;
+      if (obj.type === 'commit') return cur;
+      if (obj.type === 'tag') {
+        cur = this.parseTag(obj.data).object;
+        continue;
+      }
+      return cur;
     }
     return cur;
   }
-  return cur;
 }
 
-// ---- reachability -----------------------------------------------------------
+// ---- merge helpers shared by REST, GraphQL and MCP ---------------------------
 
-/** All commit oids reachable from `tips` by following parents. */
-export function ancestorCommits(v: Vault, tips: string[]): Set<string> {
-  const seen = new Set<string>();
-  const stack = [...tips];
-  while (stack.length) {
-    const oid = stack.pop()!;
-    if (seen.has(oid)) continue;
-    const obj = loadObject(v, oid);
-    if (!obj || obj.type !== 'commit') continue;
-    seen.add(oid);
-    for (const parent of readCommit(obj.data).parents) stack.push(parent);
+/** True when merging `pull` would conflict: a file the head changed (against the
+ * merge-base, which is the base sha the PR was opened against) was also changed
+ * on the base branch since then. */
+export function mergeConflict(store: Store, repo: Repo, pull: Pull): boolean {
+  const baseFiles = store.filesOfCommit(pull.baseSha);
+  const headFiles = store.filesOfCommit(pull.headSha);
+  const currentTip = store.repoRefs(repo.name).get(`refs/heads/${pull.baseRef}`);
+  if (!currentTip) return false;
+  const currentFiles = store.filesOfCommit(currentTip);
+  const changed = new Set<string>();
+  for (const [p, h] of headFiles) {
+    const b = baseFiles.get(p);
+    if (!b || b.blobOid !== h.blobOid) changed.add(p);
   }
-  return seen;
-}
-
-/** Whether `maybeAncestor` is an ancestor of (or equal to) `tip`. */
-export function isAncestorOf(v: Vault, tip: string, maybeAncestor: string): boolean {
-  if (tip === maybeAncestor) return true;
-  const seen = new Set<string>();
-  const stack = [tip];
-  while (stack.length) {
-    const oid = stack.pop()!;
-    if (oid === maybeAncestor) return true;
-    if (seen.has(oid)) continue;
-    seen.add(oid);
-    const obj = loadObject(v, oid);
-    if (!obj || obj.type !== 'commit') continue;
-    for (const parent of readCommit(obj.data).parents) stack.push(parent);
+  for (const p of baseFiles.keys()) if (!headFiles.has(p)) changed.add(p);
+  for (const p of changed) {
+    if ((baseFiles.get(p)?.blobOid ?? null) !== (currentFiles.get(p)?.blobOid ?? null)) return true;
   }
   return false;
 }
 
-/** All object oids in a commit's closure (the commit, its trees and blobs, recursive). */
-export function closureOf(v: Vault, commitOid: string): Set<string> {
-  const out = new Set<string>();
-  const commit = loadObject(v, commitOid);
-  if (!commit) return out;
-  out.add(commitOid);
-  const { tree } = readCommit(commit.data);
-  const walkTree = (treeOid: string): void => {
-    if (out.has(treeOid)) return;
-    out.add(treeOid);
-    const treeObj = loadObject(v, treeOid);
-    if (!treeObj || treeObj.type !== 'tree') return;
-    for (const item of decodeTree(treeObj.data)) {
-      if (item.mode === '40000') walkTree(item.oid);
-      else out.add(item.oid);
-    }
-  };
-  walkTree(tree);
-  return out;
-}
-
-/**
- * The objects a fetch must deliver for `wants`, with an optional depth cap.
- * Returns the object map plus the shallow boundary (commits whose parents were cut)
- * and the previously-shallow commits that are now fully included (unshallow).
- * `held` lists the commits the client already has (its `have` lines); without a depth
- * cap the whole closure of each held commit is excluded, with a cap only the held
- * commit's own tree is excluded (a shallow clone never held the parents).
- */
-export function fetchPlan(
-  v: Vault,
-  wants: string[],
-  held: string[],
-  shallowNow: string[],
-  depth: number | null,
-): { objects: Map<string, GitObject>; shallow: string[]; unshallow: string[] } {
-  // Generation of every reachable commit: the want is generation 0, its parents 1, ...
-  // A want may be an annotated tag: the tag object itself is delivered, and the
-  // generation walk starts at the commit it peels to.
-  const generation = new Map<string, number>();
-  const extraIncluded = new Set<string>();
-  const queue: Array<[string, number]> = [];
-  for (const want of wants) {
-    let cur = want;
-    for (let hop = 0; hop < 10; hop += 1) {
-      const obj = loadObject(v, cur);
-      if (!obj || obj.type !== 'tag') break;
-      extraIncluded.add(cur);
-      cur = readTag(obj.data).object;
-    }
-    queue.push([cur, 0]);
+/** Paths whose content differs between the PR's base and head, sorted. */
+export function pullChangedPaths(store: Store, repo: Repo, pull: Pull): string[] {
+  const baseFiles = store.filesOfCommit(pull.baseSha);
+  const headFiles = store.filesOfCommit(pull.headSha);
+  const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
+  const out: string[] = [];
+  for (const p of [...paths].sort()) {
+    const b = baseFiles.get(p);
+    const h = headFiles.get(p);
+    if (!b || !h || b.blobOid !== h.blobOid) out.push(p);
   }
-  const commits = new Set<string>();
-  while (queue.length) {
-    const [oid, gen] = queue.shift()!;
-    if (generation.has(oid)) continue;
-    const obj = loadObject(v, oid);
-    if (!obj || obj.type !== 'commit') continue;
-    generation.set(oid, gen);
-    commits.add(oid);
-    if (depth !== null && gen >= depth - 1) continue;
-    for (const parent of readCommit(obj.data).parents) queue.push([parent, gen + 1]);
-  }
-  // With a depth cap, only generations below the cap are included.
-  const included = new Set<string>();
-  for (const [oid, gen] of generation) {
-    if (depth === null || gen < depth) included.add(oid);
-  }
-  const shallow: string[] = [];
-  if (depth !== null) {
-    for (const oid of included) {
-      if (generation.get(oid) === depth - 1) shallow.push(oid);
-    }
-  }
-  const unshallow: string[] = [];
-  for (const old of shallowNow) {
-    if (included.has(old)) unshallow.push(old);
-  }
-  // Objects the client already holds. A held tag means the client already has
-  // the tag and its target's closure.
-  const excluded = new Set<string>();
-  for (const hold of held) {
-    let cur = hold;
-    for (let hop = 0; hop < 10; hop += 1) {
-      const obj = loadObject(v, cur);
-      if (!obj || obj.type !== 'tag') break;
-      excluded.add(cur);
-      cur = readTag(obj.data).object;
-    }
-    if (depth === null) {
-      for (const oid of closureOf(v, cur)) excluded.add(oid);
-      for (const oid of ancestorCommits(v, [cur])) {
-        for (const extra of closureOf(v, oid)) excluded.add(extra);
-      }
-    } else {
-      // A shallow holder only ever had the commit's own tree.
-      for (const oid of closureOf(v, cur)) excluded.add(oid);
-    }
-  }
-  const objects = new Map<string, GitObject>();
-  for (const oid of included) {
-    for (const member of closureOf(v, oid)) {
-      if (excluded.has(member)) continue;
-      const obj = loadObject(v, member);
-      if (obj) objects.set(member, obj);
-    }
-  }
-  // Tag objects the wants named are delivered even though they are not commits.
-  for (const oid of extraIncluded) {
-    if (excluded.has(oid)) continue;
-    const obj = loadObject(v, oid);
-    if (obj) objects.set(oid, obj);
-  }
-  return { objects, shallow, unshallow };
-}
-
-/** The per-file change between two trees: added / modified / removed paths. */
-export function diffTrees(
-  v: Vault,
-  baseTip: string,
-  headTip: string,
-): Array<{ path: string; status: 'added' | 'modified' | 'removed'; base: string | null; head: string | null }> {
-  const baseFiles = flattenCommit(v, baseTip);
-  const headFiles = flattenCommit(v, headTip);
-  const out: Array<{ path: string; status: 'added' | 'modified' | 'removed'; base: string | null; head: string | null }> = [];
-  for (const [path, file] of headFiles) {
-    const prev = baseFiles.get(path);
-    if (!prev) out.push({ path, status: 'added', base: null, head: file.blob });
-    else if (prev.blob !== file.blob) out.push({ path, status: 'modified', base: prev.blob, head: file.blob });
-  }
-  for (const [path, file] of baseFiles) {
-    if (!headFiles.has(path)) out.push({ path, status: 'removed', base: file.blob, head: null });
-  }
-  out.sort((a, b) => (a.path < b.path ? -1 : 1));
   return out;
 }
